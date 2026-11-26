@@ -1,0 +1,79 @@
+name: proof
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: STS environment
+        type: choice
+        options: [staging, production]
+        required: true
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  proof:
+    runs-on: ubuntu-latest
+    environment: sts-proof-${{ inputs.env }}
+    timeout-minutes: 10
+    env:
+      STS: ${{ inputs.env == 'production' && 'https://sts.kiloapps.io' || 'https://sts-staging.kiloapps.io' }}
+      ACCT: e115e769bcdd4c3d66af59d3332cb394
+      SCRIPT: sts-deploy-proof-${{ inputs.env }}
+      CF: https://api.cloudflare.com/client/v4
+    steps:
+      - name: Mint, use, refuse, revoke
+        shell: bash
+        run: |
+          set -uo pipefail
+          oidc() { curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$STS" | jq -r .value; }
+          say() { echo "PROOF $*"; }
+          fail=0
+          # 1. mint
+          code=$(curl -sS -o mint.json -w '%{http_code}' -X POST "$STS/v1/ci/cloudflare-deploy-token" -H "Authorization: Bearer $(oidc)")
+          tok=$(jq -r '.token // empty' mint.json); [ -n "$tok" ] && echo "::add-mask::$tok"
+          say "mint http=$code body=$(jq -c 'del(.token)' mint.json)"
+          [ "$code" = 200 ] && [ -n "$tok" ] || { say "FAIL mint"; exit 1; }
+          tid=$(jq -r .tokenId mint.json)
+          say "token prefix=${tok:0:5} len=${#tok}"
+          # 2. second mint while one is active: STS must refuse (maxActive 1)
+          code=$(curl -sS -o mint2.json -w '%{http_code}' -X POST "$STS/v1/ci/cloudflare-deploy-token" -H "Authorization: Bearer $(oidc)")
+          t2=$(jq -r '.token // empty' mint2.json); [ -n "$t2" ] && echo "::add-mask::$t2"
+          say "second-mint http=$code body=$(jq -c 'del(.token)' mint2.json)"
+          [ "$code" = 429 ] || { say "FAIL second mint not limited"; fail=1; }
+          H=(-H "Authorization: Bearer $tok")
+          # 3. allowed: verify, upload a throwaway Worker, delete it
+          say "verify $(curl -sS "${H[@]}" "$CF/accounts/$ACCT/tokens/verify" | jq -c '{success, status: .result.status, expires_on: .result.expires_on}')"
+          printf 'export default { fetch() { return new Response("sts deploy-token proof"); } };\n' > worker.mjs
+          printf '{"main_module":"worker.mjs","compatibility_date":"2026-11-01"}' > meta.json
+          code=$(curl -sS -o up.json -w '%{http_code}' -X PUT "${H[@]}" "$CF/accounts/$ACCT/workers/scripts/$SCRIPT" \
+            -F "metadata=@meta.json;type=application/json" -F "worker.mjs=@worker.mjs;type=application/javascript+module")
+          say "upload http=$code success=$(jq -c '.success' up.json) modified_on=$(jq -r '.result.modified_on // empty' up.json) errors=$(jq -c '.errors' up.json)"
+          [ "$code" = 200 ] || { say "FAIL upload"; fail=1; }
+          code=$(curl -sS -o del.json -w '%{http_code}' -X DELETE "${H[@]}" "$CF/accounts/$ACCT/workers/scripts/$SCRIPT?force=true")
+          say "delete-script http=$code success=$(jq -c '.success' del.json)"
+          [ "$code" = 200 ] || { say "FAIL delete script"; fail=1; }
+          # 4. refused: create a token, list tokens, read DNS of a zone
+          code=$(curl -sS -o mk.json -w '%{http_code}' -X POST "${H[@]}" "$CF/accounts/$ACCT/tokens" -H 'content-type: application/json' \
+            -d '{"name":"sts-proof-must-fail","policies":[{"effect":"allow","permission_groups":[{"id":"e086da7e2179491d91ee5f35b3ca210a"}],"resources":{"com.cloudflare.api.account.'"$ACCT"'":"*"}}]}')
+          mkid=$(jq -r '.result.id // empty' mk.json); v=$(jq -r '.result.value // empty' mk.json); [ -n "$v" ] && echo "::add-mask::$v"
+          say "create-token http=$code success=$(jq -c '.success' mk.json) errors=$(jq -c '[.errors[]?.code]' mk.json)"
+          if [ -n "$mkid" ]; then say "FAIL token create succeeded id=$mkid; deleting"; curl -sS -o /dev/null -X DELETE "${H[@]}" "$CF/accounts/$ACCT/tokens/$mkid"; fail=1; fi
+          code=$(curl -sS -o ls.json -w '%{http_code}' "${H[@]}" "$CF/accounts/$ACCT/tokens")
+          say "list-tokens http=$code success=$(jq -c '.success' ls.json)"
+          [ "$code" = 200 ] && { say "FAIL list tokens allowed"; fail=1; }
+          code=$(curl -sS -o zn.json -w '%{http_code}' "${H[@]}" "$CF/zones/9f7103cbcadbe93a052c120f231e8507/dns_records?per_page=1")
+          say "dns-read http=$code success=$(jq -c '.success' zn.json)"
+          [ "$code" = 200 ] && { say "FAIL dns read allowed"; fail=1; }
+          # 5. revoke, then the token is dead
+          code=$(curl -sS -o rv.json -w '%{http_code}' -X POST "$STS/v1/ci/cloudflare-deploy-token/revoke" -H "Authorization: Bearer $(oidc)" -H 'content-type: application/json' -d "{\"tokenId\":\"$tid\"}")
+          say "revoke http=$code body=$(jq -c . rv.json)"
+          [ "$code" = 200 ] || { say "FAIL revoke"; fail=1; }
+          sleep 5
+          code=$(curl -sS -o vf.json -w '%{http_code}' "${H[@]}" "$CF/accounts/$ACCT/tokens/verify")
+          say "verify-after-revoke http=$code success=$(jq -c '.success' vf.json) errors=$(jq -c '[.errors[]?.code]' vf.json)"
+          [ "$code" = 200 ] && [ "$(jq -r .success vf.json)" = true ] && { say "FAIL token alive after revoke"; fail=1; }
+          code=$(curl -sS -o rv2.json -w '%{http_code}' -X POST "$STS/v1/ci/cloudflare-deploy-token/revoke" -H "Authorization: Bearer $(oidc)" -H 'content-type: application/json' -d '{"tokenId":"00000000000000000000000000000000"}')
+          say "revoke-unknown http=$code body=$(jq -c . rv2.json)"
+          say "run_id=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT tokenId=$tid result=$([ $fail = 0 ] && echo PASS || echo FAIL)"
+          rm -f mint.json mint2.json
+          exit $fail
