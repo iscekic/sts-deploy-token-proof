@@ -7,6 +7,10 @@ on:
         type: choice
         options: [staging, production]
         required: true
+      monitor_test:
+        description: Staging only. Re-deploy sts-staging's current versions unchanged with the minted token (the STS deployment watch must report it)
+        type: boolean
+        default: false
 permissions:
   contents: read
   id-token: write
@@ -52,6 +56,16 @@ jobs:
           code=$(curl -sS -o del.json -w '%{http_code}' -X DELETE "${H[@]}" "$CF/accounts/$ACCT/workers/scripts/$SCRIPT?force=true")
           say "delete-script http=$code success=$(jq -c '.success' del.json)"
           [ "$code" = 200 ] || { say "FAIL delete script"; fail=1; }
+          # 3b. monitor live test: same versions of sts-staging, new deployment, outside any deploy job
+          if [ "${{ inputs.monitor_test }}" = true ] && [ "${{ inputs.env }}" = staging ]; then
+            code=$(curl -sS -o cur.json -w '%{http_code}' "${H[@]}" "$CF/accounts/$ACCT/workers/scripts/sts-staging/deployments")
+            versions=$(jq -c '.result.deployments[0].versions | map({version_id, percentage})' cur.json)
+            say "monitor-test current http=$code deployment=$(jq -r '.result.deployments[0].id' cur.json) versions=$versions"
+            jq -n --argjson v "$versions" '{strategy:"percentage", versions:$v, annotations:{"workers/message":"sts deploy-token proof: monitor live test, same versions"}}' > dep.json
+            code=$(curl -sS -o newdep.json -w '%{http_code}' -X POST "${H[@]}" "$CF/accounts/$ACCT/workers/scripts/sts-staging/deployments" -H 'content-type: application/json' --data @dep.json)
+            say "monitor-test deploy http=$code success=$(jq -c '.success' newdep.json) id=$(jq -r '.result.id // empty' newdep.json) created_on=$(jq -r '.result.created_on // empty' newdep.json) source=$(jq -r '.result.source // empty' newdep.json) versions=$(jq -c '.result.versions // [] | map({version_id, percentage})' newdep.json) errors=$(jq -c '[.errors[]?.code]' newdep.json)"
+            [ "$code" = 200 ] || { say "FAIL monitor-test deploy"; fail=1; }
+          fi
           # 4. refused: create a token, list tokens, read DNS of a zone
           code=$(curl -sS -o mk.json -w '%{http_code}' -X POST "${H[@]}" "$CF/accounts/$ACCT/tokens" -H 'content-type: application/json' \
             -d '{"name":"sts-proof-must-fail","policies":[{"effect":"allow","permission_groups":[{"id":"e086da7e2179491d91ee5f35b3ca210a"}],"resources":{"com.cloudflare.api.account.'"$ACCT"'":"*"}}]}')
